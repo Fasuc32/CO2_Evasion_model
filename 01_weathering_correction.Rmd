@@ -1,0 +1,188 @@
+---
+title: "Step 1. Weathering correction before CO2-evasion modelling"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r script_metadata, include=FALSE}
+# Script: Weathering correction before CO2-evasion modelling
+# Author: Francesco Ulloa-Cedamanos
+# Project: Riverine carbon and CO2-evasion modelling
+# Date created: October 10, 2026
+# Date last modified: October 10, 2026
+```
+
+## Purpose
+
+This script removes the modelled weathering contributions from stream-water carbon pools and recalculates the corresponding pre-weathering carbon-isotope composition. The resulting dataset is used as input to the isotope-based CO2-evasion model in Step 2.
+
+**Inputs:** `CleanDatabase.csv` and `MEGA_Modelling.csv`.  
+**Output:** `Weathering_modelling.csv`.
+
+The input datasets are not included in this repository. Update the file paths below to match your local data folders before running the code.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## 1. Load packages
+
+```{r}
+library(tidyverse)
+```
+
+## 2. Import, compile, and summarise the data
+
+Duplicate samples for the same site and date are combined by retaining the first value for general site/sample metadata and averaging the major-ion measurements.
+
+```{r}
+# Replace these paths with the locations of the input files.
+database_path <- "path/to/CleanDatabase.csv"
+mega_path <- "path/to/MEGA_Modelling.csv"
+output_path <- "path/to/Weathering_modelling.csv"
+
+# Main database
+db <- read_csv(database_path, show_col_types = FALSE) %>%
+  mutate(Date = as.POSIXct(Date, format = "%d/%m/%Y")) %>%
+  filter(!is.na(Ca)) 
+
+# MEGA geochemical-model outputs
+MEGA <- read_csv(mega_path, show_col_types = FALSE) %>%
+  mutate(Date = as.POSIXct(Date, format = "%d/%m/%Y")) 
+
+# Combine the compiled database and MEGA results.
+df <- purrr::reduce(list(db, MEGA), dplyr::full_join) %>%
+  select(
+    Date, ID, DIC, DIC.C13, pH, Temperature, DOC.C13, CO2, CO2.C13,
+    HCO, C.CO2.carb, C.CO2.sil, C.HCO3.geog, Q
+  )
+```
+
+## 3. Correct carbon pools for weathering and calculate isotope composition
+
+Carbonate-derived geogenic bicarbonate and the modelled carbonate-weathering contribution are removed from the measured carbon pools according to the current analysis workflow. Carbon-isotope ratios are then recalculated after accounting for internal fractionation among dissolved CO2, bicarbonate, and carbonate.
+
+```{r}
+# Convert between delta notation and 13C/12C ratios.
+Rpdb <- 0.0112372
+
+Ratio_fun <- function(d13permil) {
+  (d13permil / 1000 + 1) * Rpdb
+}
+
+Delta_fun <- function(R) {
+  (R / Rpdb - 1) * 1000
+}
+
+# Assumed delta-13C value of geogenic HCO3 (per mil).
+d13_carb <- 0
+
+df1 <- df %>%
+  mutate(
+    TinK = Temperature + 273.15,
+
+    # Carbonate-system equilibrium constants
+    logKa = -3404.71 / TinK + 14.8435 - 0.032786 * TinK,
+    Ka = 10^logKa,
+    pKa = -log10(Ka),
+    logKb = -2902.39 / TinK + 6.4980 - 0.02379 * TinK,
+    Kb = 10^logKb,
+
+    # Isotopic fractionation factors
+    eb = -9.484 * 1e3 / TinK + 23.89,
+    ab = 1 + eb / 1000,
+    ec = (-0.114 * Temperature + 10.78) -
+      (-0.052 * Temperature + 7.22),
+    ac = 1 + ec / 1000
+  ) %>%
+  
+  mutate(
+    # Carbonate speciation before weathering correction
+    CO2aq = DIC * (10^-pH)^2 /
+      ((10^-pH)^2 + 10^logKa * 10^-pH +
+         10^logKa * 10^logKb),
+    HCOaq = DIC * (Ka * 10^-pH) /
+      ((10^-pH)^2 + Ka * 10^-pH + Ka * Kb),
+    CO3aq = DIC - HCOaq - CO2aq,
+
+    # Use equilibrium-derived CO2 if it differs from measured CO2 by >10.
+    CO2cl = ifelse(
+      abs(CO2aq - CO2) > 10,
+      CO2aq,
+      CO2
+    ),
+    delta = CO2aq - CO2,
+
+    # Carbon pools after the weathering correction
+    DICrw = DIC - C.HCO3.geog,
+    CO2rw = CO2cl + C.CO2.carb,
+    HCO3rw = HCO - C.CO2.carb - C.HCO3.geog,
+    CO3rw = DICrw - HCO3rw - CO2rw,
+    pHrw = -log10(Ka * CO2rw / HCO3rw)
+  ) %>%
+  
+  mutate(
+    # Convert measured bulk DIC isotope composition to an isotope ratio.
+    R_DIC_meas = Ratio_fun(DIC.C13),
+    DIC_iso_meas = R_DIC_meas * DIC,
+
+    # Theoretical internal fractionation among dissolved carbon species
+    denom = CO2aq + HCOaq / ab + CO3aq / (ab * ac),
+    CO2.C13iso = Delta_fun(DIC_iso_meas / denom),
+    HCO3.C13iso = Delta_fun(DIC_iso_meas / denom / ab),
+    CO3.C13iso = Delta_fun(DIC_iso_meas / denom / ab / ac),
+    delta.CO2.C13 = CO2.C13iso - CO2.C13,
+
+    # Remove the external geogenic carbonate contribution
+    iso_residual = DIC_iso_meas -
+      C.HCO3.geog * Ratio_fun(d13_carb),
+
+    # Recalculate isotope ratios after weathering correction
+    denom_rw = CO2rw + HCO3rw / ab + CO3rw / (ab * ac),
+    R_CO2_rw = iso_residual / denom_rw,
+    R_HCO3_rw = R_CO2_rw / ab,
+    R_CO3_rw = R_HCO3_rw / ac,
+
+    # Isotope contributions of the corrected carbon pools
+    CO2_13_rw = CO2rw * R_CO2_rw,
+    HCO3_13_rw = HCO3rw * R_HCO3_rw,
+    CO3_13_rw = CO3rw * R_CO3_rw,
+    DIC13_rw_check = CO2_13_rw + HCO3_13_rw + CO3_13_rw,
+
+    # Isotope mass-balance check
+    check_balance = iso_residual - DIC13_rw_check,
+
+    # Corrected delta-13C values (per mil)
+    CO2.C13rw = Delta_fun(R_CO2_rw),
+    HCO3.C13rw = Delta_fun(R_HCO3_rw),
+    CO3.C13rw = Delta_fun(R_CO3_rw),
+    DIC.C13rw = Delta_fun(DIC13_rw_check / DICrw)
+  ) %>%
+  select(
+    -DIC_iso_meas, -iso_residual, -denom_rw,
+    -CO2_13_rw, -HCO3_13_rw, -CO3_13_rw, -DIC13_rw_check
+  )
+```
+
+## 4. Export the corrected dataset
+
+The output contains the corrected DIC concentration and isotope composition, pH, dissolved CO2, bicarbonate and carbonate variables, together with the other fields required by Step 2.
+
+```{r}
+df2 <- df1 %>%
+  select(
+    Date, ID, DICrw, DIC.C13rw, pHrw, Temperature,
+    DOC.C13, CO2rw, CO2.C13rw, Q,
+    HCO3rw, CO3rw, HCO3.C13rw, CO3.C13rw
+  )
+
+write_csv(df2, output_path)
+```
+
+**Output for Step 2:** `Weathering_modelling.csv`.

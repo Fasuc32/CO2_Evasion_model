@@ -1,0 +1,494 @@
+---
+title: "Step 2. Isotope-based CO2-evasion modelling"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r script_metadata, include=FALSE}
+# Script: Isotope-based CO2-evasion modelling
+# Author: Francesco Ulloa-Cedamanos
+# Project: Riverine carbon and CO2-evasion modelling
+# Date created: October 10, 2026
+# Date last modified: October 10, 2026
+```
+
+## Purpose
+
+This script applies the inverse isotope-based degassing model to the weathering-corrected carbon data prepared in Step 1. For each sample, the inverse model optimises the initial DIC concentration, pH, initial DIC isotope composition, and groundwater input to minimise the mismatch between modelled and observed values.
+
+**Inputs:** `CleanDatabase.csv` and the `Weathering_modelling.csv` output from Step 1.  
+**Output:** `Evasion_Modelling_RW_DIC_pH_CO2.csv`.
+
+The input datasets are not included in this repository. Update the file paths below before running the code.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## 1. Load packages
+
+```{r}
+library(tidyverse)
+```
+
+## 2. Define the carbonate-equilibrium function
+
+`pH_from_Alk()` estimates pH from DIC, alkalinity, and temperature during each iteration of the degassing model.
+
+```{r}
+pH_from_Alk <- function(DIC, Alk, TinC) {
+  TinK <- TinC + 273.15
+
+  # Equilibrium constants
+  logKa <- -3404.71 / TinK + 14.8435 - 0.032786 * TinK
+  logKb <- -2902.39 / TinK + 6.4980 - 0.02379 * TinK
+
+  # Water ionisation constant
+  pKw <- -log10(exp(148.9802 - 13847.26 / TinK - 23.6521 * log(TinK)))
+
+  Ka <- 10^logKa
+  Kb <- 10^logKb
+
+  # Objective function: difference between modelled and target alkalinity
+  expfun <- function(params) {
+    pH <- params[1]
+    pOH <- pKw - pH
+    H <- 10^(-pH)
+    OH <- 10^(-pOH)
+
+    modelAlk <- DIC * (Ka * H) /
+      (H^2 + Ka * H + Ka * Kb) +
+      2 * DIC * (Ka * Kb) /
+      (H^2 + Ka * H + Ka * Kb) +
+      OH - H
+
+    (modelAlk - Alk)^2
+  }
+
+  result <- optim(
+    par = 7,
+    fn = expfun,
+    method = "Brent",
+    lower = 3,
+    upper = 10
+  )
+
+  modelpH <- result$par[1]
+  modelpOH <- pKw - modelpH
+
+  c(modelpH, modelpOH)
+}
+```
+
+## 3. Define the forward degassing model
+
+The forward model simulates changes in DIC concentration, DIC and CO2 isotope composition, carbonate speciation, and pH during gas exchange. It includes optional groundwater input (`GW`) and returns the modelled trajectory.
+
+```{r}
+degassingModel <- function(
+  DICconcinit, d13CDICinit, pHinit, Temperature,
+  GW = 0, k = 0.02, runlength = 1000
+) {
+  # Isotope-ratio conversion functions
+  Rpdb <- 0.0112372
+  Delta <- function(x) (x / Rpdb - 1) * 1000
+  Ratio <- function(x) (x / 1000 + 1) * Rpdb
+  TinK <- Temperature + 273.15
+
+  # Isotopic fractionation factors
+  eb <- -9.484 * 1e3 / TinK + 23.89
+  ab <- eb / 1000 + 1
+  eg <- -0.373 * 1e3 / TinK + 0.19
+  ag <- eg / 1000 + 1
+  ec <- (-0.114 * Temperature + 10.78) -
+    (-0.052 * Temperature + 7.22)
+  ac <- ec / 1000 + 1
+
+  # Equilibrium constants
+  logKa <- -3404.71 / TinK + 14.8435 - 0.032786 * TinK
+  logKb <- -2902.39 / TinK + 6.4980 - 0.02379 * TinK
+  logKH <- -(-2385.73 / TinK + 14.0184 - 0.0152642 * TinK)
+  pKw <- -log10(exp(
+    148.9802 - 13847.26 / TinK - 23.6521 * log(TinK)
+  ))
+
+  # Atmospheric CO2 equilibrium concentration
+  pCO2atm <- 410
+  CO2satconc <- 10^logKH * pCO2atm
+
+  # Initialise model vectors
+  prealloc <- rep(0, runlength)
+  gemass <- geiso <- volume <- CO2mass <- CO2conc <- CO2iso <- CO2ratio <-
+    HCO3mass <- HCO3conc <- HCO3ratio <- HCO3iso <-
+    DICmass <- DICconc <- DICratio <- DICiso <-
+    CO3mass <- CO3conc <- CO3ratio <- CO3iso <-
+    Hmass <- Hconc <- pH <- OHmass <- OHconc <- pOH <-
+    Alk <- Alkmass <- prealloc
+
+  # Initial conditions
+  volume[1] <- 0.1
+  DICconc[1] <- DICconcinit
+  DICmass[1] <- DICconc[1] * volume[1]
+  pH[1] <- pHinit
+  Hconc[1] <- 10^(-pH[1])
+  Hmass[1] <- Hconc[1] * volume[1]
+  pOH[1] <- pKw - pH[1]
+  OHconc[1] <- 10^(-pOH[1])
+  OHmass[1] <- OHconc[1] * volume[1]
+
+  CO2conc[1] <- DICconc[1] * (10^(-pH[1]))^2 /
+    ((10^(-pH[1]))^2 + 10^logKa * 10^(-pH[1]) +
+       10^logKa * 10^logKb)
+  CO2mass[1] <- CO2conc[1] * volume[1]
+
+  HCO3conc[1] <- DICconc[1] * (10^logKa * 10^(-pH[1])) /
+    ((10^(-pH[1]))^2 + 10^logKa * 10^(-pH[1]) +
+       10^logKa * 10^logKb)
+  HCO3mass[1] <- HCO3conc[1] * volume[1]
+
+  CO3conc[1] <- DICconc[1] - CO2conc[1] - HCO3conc[1]
+  Alkconc <- HCO3conc[1] + 2 * CO3conc[1] +
+    10^(-pOH[1]) - 10^(-pH[1])
+  Alkmass[1] <- Alkconc * volume[1]
+
+  DICratio[1] <- Ratio(d13CDICinit)
+  DICiso[1] <- DICmass[1] * DICratio[1]
+  CO2ratio[1] <- (DICconc[1] * ab * ac * DICratio[1]) /
+    (CO3conc[1] + HCO3conc[1] * ac + CO2conc[1] * ab * ac)
+  CO2iso[1] <- CO2mass[1] * CO2ratio[1]
+  HCO3ratio[1] <- CO2ratio[1] / ab
+  HCO3iso[1] <- HCO3mass[1] * HCO3ratio[1]
+  CO3ratio[1] <- HCO3ratio[1] / ac
+  CO3iso[1] <- CO3mass[1] * CO3ratio[1]
+
+  # Simulate gas exchange and optional groundwater input
+  for (i in 2:runlength) {
+    gemass[i] <- k * (CO2satconc - CO2conc[i - 1])
+    geiso[i] <- k * 0.9987 * (
+      CO2satconc * Ratio(-7.75) * 0.9989 -
+        CO2conc[i - 1] * CO2ratio[i - 1]
+    )
+
+    volume[i] <- volume[i - 1] + GW
+    DICmass[i] <- DICmass[i - 1] + gemass[i] + DICconc[1] * GW
+    DICconc[i] <- DICmass[i] / volume[i]
+    DICiso[i] <- DICiso[i - 1] + geiso[i] +
+      DICiso[1] / volume[1] * GW
+    DICratio[i] <- DICiso[i] / DICmass[i]
+
+    pH_pOH <- pH_from_Alk(DICconc[i], Alkconc, Temperature)
+    pH[i] <- pH_pOH[1]
+    pOH[i] <- pH_pOH[2]
+
+    Hconc[i] <- 10^(-pH[i])
+    OHconc[i] <- 10^(-pOH[i])
+    Hmass[i] <- Hconc[i] * volume[i] + Hconc[1] * GW
+    OHmass[i] <- OHconc[i] * volume[i] + OHconc[1] * GW
+    Hconc[i] <- Hmass[i] / volume[i]
+    OHconc[i] <- OHmass[i] / volume[i]
+    pH[i] <- -log10(Hconc[i])
+    pOH[i] <- pKw - pH[i]
+
+    CO2conc[i] <- DICconc[i] * (10^(-pH[i]))^2 /
+      ((10^(-pH[i]))^2 + 10^logKa * 10^(-pH[i]) +
+         10^logKa * 10^logKb)
+    HCO3conc[i] <- DICconc[i] * (10^logKa * 10^(-pH[i])) /
+      ((10^(-pH[i]))^2 + 10^logKa * 10^(-pH[i]) +
+         10^logKa * 10^logKb)
+    CO3conc[i] <- DICconc[i] - CO2conc[i] - HCO3conc[i]
+
+    CO2ratio[i] <- (DICconc[i] * ab * ac * DICratio[i]) /
+      (CO3conc[i] + HCO3conc[i] * ac + CO2conc[i] * ab * ac)
+  }
+
+  list(
+    DICconc = DICconc,
+    d13CDIC = Delta(DICratio),
+    gemass = gemass,
+    CO2conc = CO2conc,
+    d13CCO2 = Delta(CO2ratio),
+    pH = pH,
+    Alkconc = Alkconc,
+    volume = volume,
+    geiso = geiso
+  )
+}
+```
+
+## 4. Define parameter transformations and the inverse model
+
+The inverse model optimises four parameters within predefined bounds: initial DIC concentration, initial pH, initial DIC isotope composition, and groundwater input. The objective function compares modelled values against the observed DIC concentration, pH, δ13C-DIC, CO2 concentration, and δ13C-CO2.
+
+```{r}
+transform <- function(p, bounds) {
+  transform_param <- function(x, min_val, max_val) {
+    a <- (max_val - min_val) / 2
+    b <- (min_val + max_val) / 2
+    x_scaled <- (x - b) / a
+    x_scaled <- pmin(pmax(x_scaled, -1), 1)
+    asin(x_scaled)
+  }
+
+  list(
+    DICconcinit = transform_param(
+      p$DICconcinit, bounds$DICconcinit[1], bounds$DICconcinit[2]
+    ),
+    pHinit = transform_param(
+      p$pHinit, bounds$pHinit[1], bounds$pHinit[2]
+    ),
+    d13CDICinit = transform_param(
+      p$d13CDICinit, bounds$d13CDICinit[1], bounds$d13CDICinit[2]
+    ),
+    GW = transform_param(p$GW, bounds$GW[1], bounds$GW[2])
+  )
+}
+
+detransform <- function(p_trans, bounds) {
+  detransform_param <- function(y, min_val, max_val) {
+    a <- (max_val - min_val) / 2
+    b <- (min_val + max_val) / 2
+    a * sin(y) + b
+  }
+
+  list(
+    DICconcinit = detransform_param(
+      p_trans$DICconcinit, bounds$DICconcinit[1], bounds$DICconcinit[2]
+    ),
+    pHinit = detransform_param(
+      p_trans$pHinit, bounds$pHinit[1], bounds$pHinit[2]
+    ),
+    d13CDICinit = detransform_param(
+      p_trans$d13CDICinit,
+      bounds$d13CDICinit[1], bounds$d13CDICinit[2]
+    ),
+    GW = detransform_param(p_trans$GW, bounds$GW[1], bounds$GW[2])
+  )
+}
+
+expfun <- function(
+  params, bounds, Temperature, DICconc, d13CDIC,
+  pH, CO2conc, d13CCO2
+) {
+  p_trans <- list(
+    DICconcinit = params[1],
+    pHinit = params[2],
+    d13CDICinit = params[3],
+    GW = params[4]
+  )
+
+  p <- detransform(p_trans, bounds)
+  model_results <- degassingModel(
+    p$DICconcinit, p$d13CDICinit, p$pHinit, Temperature, p$GW
+  )
+
+  modeled_DICconc <- approx(
+    model_results$d13CDIC, model_results$DICconc,
+    xout = d13CDIC, rule = 2
+  )$y
+  modeled_pH <- approx(
+    model_results$d13CDIC, model_results$pH,
+    xout = d13CDIC, rule = 2
+  )$y
+  modeled_d13CDIC <- approx(
+    model_results$d13CDIC, model_results$d13CDIC,
+    xout = d13CDIC, rule = 2
+  )$y
+  modeled_CO2conc <- approx(
+    model_results$d13CDIC, model_results$CO2conc,
+    xout = d13CDIC, rule = 2
+  )$y
+  modeled_d13CCO2 <- approx(
+    model_results$d13CCO2, model_results$d13CCO2,
+    xout = d13CCO2, rule = 2
+  )$y
+
+  error_DIC <- (DICconc - modeled_DICconc) / DICconc
+  error_pH <- (pH - modeled_pH) / pH
+  error_d13CDIC <- (d13CDIC - modeled_d13CDIC) / d13CDIC
+  error_d13CCO2 <- (d13CCO2 - modeled_d13CCO2) / d13CCO2
+  error_CO2conc <- (CO2conc - modeled_CO2conc) / CO2conc
+
+  errors <- c(
+    error_DIC, error_pH, error_d13CDIC, error_CO2conc, error_d13CCO2
+  )
+  valid_errors <- errors[!is.na(errors)]
+  n <- length(valid_errors)
+  sse <- sum((valid_errors^2) * 100, na.rm = TRUE)
+  mse <- ifelse(n > 0, sse / n, NA_real_)
+  rmse <- sqrt(mse)
+
+  list(
+    SSE = sse,
+    MSE = mse,
+    RMSE = rmse,
+    modeled_DICconc = modeled_DICconc,
+    modeled_d13CDIC = modeled_d13CDIC,
+    modeled_pH = modeled_pH,
+    modeled_CO2conc = modeled_CO2conc,
+    modeled_d13CCO2 = modeled_d13CCO2
+  )
+}
+
+degassingInverseModel <- function(
+  DICconc, d13CDIC, pH, Temperature,
+  d13CDICinit, CO2conc, d13CCO2
+) {
+  bounds <- list(
+    DICconcinit = c(DICconc * 1.01, DICconc + 4500),
+    pHinit = c(3.5, 0.99 * pH),
+    d13CDICinit = c(d13CDICinit - 4, d13CDICinit + 4),
+    GW = c(0, 1e-2)
+  )
+
+  # Starting values
+  p <- list(
+    DICconcinit = DICconc * 10,
+    pHinit = pH - 2,
+    d13CDICinit = d13CDICinit,
+    GW = 1e-5
+  )
+
+  p_trans <- transform(p, bounds)
+  starting <- c(
+    p_trans$DICconcinit, p_trans$pHinit,
+    p_trans$d13CDICinit, p_trans$GW
+  )
+
+  optim_result <- optim(
+    starting,
+    function(x) expfun(
+      x, bounds, Temperature, DICconc, d13CDIC, pH, CO2conc, d13CCO2
+    )$RMSE,
+    method = "L-BFGS-B"
+  )
+
+  estimates <- optim_result$par
+  p_trans <- list(
+    DICconcinit = estimates[1],
+    pHinit = estimates[2],
+    d13CDICinit = estimates[3],
+    GW = estimates[4]
+  )
+  p <- detransform(p_trans, bounds)
+
+  model_results <- degassingModel(
+    p$DICconcinit, p$d13CDICinit, p$pHinit, Temperature, p$GW
+  )
+
+  start_error <- expfun(
+    starting, bounds, Temperature, DICconc, d13CDIC,
+    pH, CO2conc, d13CCO2
+  )
+  error_metrics <- expfun(
+    estimates, bounds, Temperature, DICconc, d13CDIC,
+    pH, CO2conc, d13CCO2
+  )
+
+  list(
+    DICconcmodel.in = model_results$DICconc[1],
+    DICconcmodel.fn = error_metrics$modeled_DICconc,
+    d13CDICmodel.in = model_results$d13CDIC[1],
+    d13CDICmodel.fn = error_metrics$modeled_d13CDIC,
+    CO2concmodel.in = model_results$CO2conc[1],
+    CO2concmodel.fn = error_metrics$modeled_CO2conc,
+    d13CCO2model.in = model_results$d13CCO2[1],
+    d13CCO2model.fn = error_metrics$modeled_d13CCO2,
+    pHmodel.in = model_results$pH[1],
+    pHmodel.fn = error_metrics$modeled_pH,
+    CO2lost = p$DICconcinit - DICconc[1],
+    GWmodel = p$GW,
+    RMSE_start = start_error$RMSE,
+    RMSE = error_metrics$RMSE
+  )
+}
+```
+
+## 5. Import weathering-corrected data
+
+The corrected dataset from Step 1 is renamed to the model's standard input variables.
+
+```{r}
+# Replace these paths with the locations of the input files.
+database_path <- "path/to/CleanDatabase.csv"
+weathering_path <- "path/to/Weathering_modelling.csv"
+output_path <- "path/to/Evasion_Modelling_RW_DIC_pH_CO2.csv"
+
+# Original database retained for the final output table
+df <- read_csv(database_path, show_col_types = FALSE) %>%
+  mutate(Date = as.POSIXct(Date, format = "%d/%m/%Y"))
+
+# Weathering-corrected model inputs from Step 1
+wr <- read_csv(weathering_path, show_col_types = FALSE) %>%
+  mutate(Date = as.POSIXct(Date, format = "%d/%m/%Y")) %>%
+  rename(
+    DIC = DICrw,
+    DIC.C13 = DIC.C13rw,
+    pH = pHrw,
+    CO2 = CO2rw,
+    CO2.C13 = CO2.C13rw
+  )
+```
+
+## 6. Apply the inverse model to each sample
+
+The inverse model is fitted for each sample using the weathering-corrected DIC concentration and isotope composition, pH, temperature, DOC isotope composition, dissolved CO2 concentration, and CO2 isotope composition.
+
+```{r}
+df1_results <- wr %>%
+  mutate(
+    model_output = pmap(
+      list(
+        DICconc = DIC,
+        d13CDIC = DIC.C13,
+        pH = pH,
+        Temperature = Temperature,
+        d13CDICinit = DOC.C13,
+        CO2conc = CO2,
+        d13CCO2 = CO2.C13
+      ),
+      ~ degassingInverseModel(..1, ..2, ..3, ..4, ..5, ..6, ..7)
+    )
+  ) %>%
+  unnest_wider(model_output) %>%
+  distinct()
+```
+
+## 7. Compile and export model outputs
+
+The model results are joined back to the original database.
+
+```{r}
+model_columns <- c(
+  "Date", "ID",
+  "HCO3rw", "CO3rw", "HCO3.C13rw", "CO3.C13rw",
+  "DICconcmodel.in", "DICconcmodel.fn",
+  "d13CDICmodel.in", "d13CDICmodel.fn",
+  "CO2concmodel.in", "CO2concmodel.fn",
+  "d13CCO2model.in", "d13CCO2model.fn",
+  "pHmodel.in", "pHmodel.fn",
+  "CO2lost", "GWmodel", "RMSE_start", "RMSE"
+)
+
+df_model <- full_join(
+  df,
+  df1_results %>% select(all_of(model_columns)),
+  by = c("Date", "ID")
+) 
+
+write_csv(df_model, output_path)
+```
+
+**Output for downstream analysis:** `Evasion_Modelling_RW_DIC_pH_CO2.csv`.
+
+## Notes
+
+- The fitted initial DIC isotope composition uses δ13C-DOC as a proxy.
+- The inverse model uses the bounds and starting values defined in `degassingInverseModel()`.
+- **Unit check before reproduction:** the carbonate-species terms inherit the units of input DIC, whereas H+ and OH− are calculated in mol L-1.
+- This script documents the workflow. Input data are not distributed with the repository.
